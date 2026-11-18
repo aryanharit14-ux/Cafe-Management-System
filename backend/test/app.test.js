@@ -1,0 +1,47 @@
+const {test}=require('node:test');
+const assert=require('node:assert/strict');
+const {createApp}=require('../app');
+const fs=require('node:fs');
+const os=require('node:os');
+const path=require('node:path');
+test('accounts, authorization, authoritative pricing, persistence and order lifecycle',async()=>{
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'juniper-test-')),databasePath=path.join(dir,'test.sqlite');
+ const app=createApp({databasePath,adminEmail:'staff@example.com',adminPassword:'Staff-test-password'});
+ const server=app.listen(0,'127.0.0.1');await new Promise(r=>server.once('listening',r));
+ const base=`http://127.0.0.1:${server.address().port}/api`;
+ const request=async(url,method='GET',body,token)=>{const response=await fetch(base+url,{method,headers:{'Content-Type':'application/json',...(token?{Authorization:'Bearer '+token}:{})},body:body?JSON.stringify(body):undefined});return {status:response.status,data:await response.json()};};
+ try {
+  const menu=await request('/menu');assert.equal(menu.status,200);assert.equal(menu.data.length,36);
+  assert.equal((await request('/orders')).status,401);
+  assert.equal((await request('/auth/register','POST',{name:'x',email:'bad',password:'123'})).status,400);
+  const registration=await request('/auth/register','POST',{name:'Test Customer',email:'TEST@example.com',password:'Customer-password',role:'admin'});assert.equal(registration.status,201);const token=registration.data.token;assert.equal(registration.data.role,'customer');
+  assert.equal((await request('/auth/register','POST',{name:'Duplicate',email:'test@example.com',password:'Customer-password'})).status,409);
+  assert.equal((await request('/auth/login','POST',{email:'test@example.com',password:'wrong'})).status,401);
+  assert.equal((await request('/orders','GET',null,token)).status,403);
+  const staff=(await request('/auth/login','POST',{email:'staff@example.com',password:'Staff-test-password'})).data.token;
+  const body={orderItems:[{menuItem:'latte',qty:2,size:'Large',milk:'Oat',price:1}],store:'Juniper • Central café',method:'Takeaway',notes:'No cutlery',requestKey:'checkout-test-1',totalAmount:1};
+  for(const qty of [-1,1.5,'2',21])assert.equal((await request('/orders','POST',{...body,orderItems:[{menuItem:'latte',qty}]},token)).status,400);
+  assert.equal((await request('/orders','POST',{...body,orderItems:[{menuItem:'latte',qty:1,milk:'Invalid'}]},token)).status,400);
+  const placed=await request('/orders','POST',body,token);assert.equal(placed.status,201);assert.equal(placed.data.totalAmount,670);const id=placed.data._id;
+  assert.equal((await request('/orders','POST',body,token)).data._id,id);
+  const mine=await request('/orders/myorders','GET',null,token);assert.equal(mine.data.length,1);assert.equal(mine.data[0].notes,'No cutlery');
+  const other=(await request('/auth/register','POST',{name:'Other Customer',email:'other@example.com',password:'Customer-password'})).data.token;
+  assert.equal((await request('/orders/myorders','GET',null,other)).data.length,0);
+  assert.equal((await request('/orders','POST',body,other)).status,409);
+  assert.equal((await request(`/orders/${id}/status`,'PUT',{status:'Completed'},staff)).status,400);
+  assert.equal((await request(`/orders/${id}/status`,'PUT',{status:'Preparing'},token)).status,403);
+  for(const status of ['Preparing','Ready','Completed'])assert.equal((await request(`/orders/${id}/status`,'PUT',{status},staff)).data.status,status);
+  assert.equal((await request(`/orders/${id}/status`,'PUT',{status:'Cancelled'},staff)).status,400);
+  const item={name:'Test brew',description:'Fresh test brew',category:'Hot coffee',price:200,image:'/images/coffee.jpg',isAvailable:true};
+  assert.equal((await request('/menu','POST',item,token)).status,403);
+  const created=await request('/menu','POST',item,staff);assert.equal(created.status,201);
+  assert.equal((await request('/menu/'+created.data._id,'PUT',{...item,price:-1},staff)).status,400);
+  assert.equal((await request('/menu/'+created.data._id,'PUT',{...item,isAvailable:false},staff)).status,200);
+  assert.equal((await request('/orders','POST',{...body,requestKey:'checkout-test-2',orderItems:[{menuItem:created.data._id,qty:1}]},token)).status,400);
+  assert.equal((await request('/menu/'+created.data._id,'DELETE',null,staff)).status,200);
+  assert.equal((await request('/auth/logout','POST',{},token)).status,200);
+  assert.equal((await request('/auth/profile','GET',null,token)).status,401);
+  assert.equal((await request('/not-a-route')).status,404);
+ }finally{await new Promise(r=>server.close(r));app.locals.db.close();}
+ const reopened=createApp({databasePath});assert.equal(reopened.locals.db.prepare('SELECT COUNT(*) AS count FROM orders').get().count,1);reopened.locals.db.close();fs.rmSync(dir,{recursive:true,force:true});
+});

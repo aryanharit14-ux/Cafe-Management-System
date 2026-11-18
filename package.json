@@ -1,0 +1,1 @@
+{"name":"juniper-coffee","private":true,"version":"1.0.0","engines":{"node":">=22.13"},"scripts":{"setup":"npm --prefix backend ci && npm --prefix frontend ci","build":"npm --prefix frontend run build","start":"node backend/server.js","dev":"node dev.js","test":"node --test backend/test/*.test.js","admin":"node backend/create-admin.js"}}

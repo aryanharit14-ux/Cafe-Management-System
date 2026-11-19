@@ -1,12 +1,12 @@
 const {test}=require('node:test');
 const assert=require('node:assert/strict');
 const {createApp}=require('../app');
-const fs=require('node:fs');
+const {testDatabase}=require('./database');
 const os=require('node:os');
 const path=require('node:path');
 test('accounts, authorization, authoritative pricing, persistence and order lifecycle',async()=>{
- const dir=fs.mkdtempSync(path.join(os.tmpdir(),'juniper-test-')),databasePath=path.join(dir,'test.sqlite');
- const app=createApp({databasePath,adminEmail:'staff@example.com',adminPassword:'Staff-test-password'});
+ const database=await testDatabase();
+ const app=await createApp({database,adminEmail:'staff@example.com',adminPassword:'Staff-test-password'});
  const server=app.listen(0,'127.0.0.1');await new Promise(r=>server.once('listening',r));
  const base=`http://127.0.0.1:${server.address().port}/api`;
  const request=async(url,method='GET',body,token)=>{const response=await fetch(base+url,{method,headers:{'Content-Type':'application/json',...(token?{Authorization:'Bearer '+token}:{})},body:body?JSON.stringify(body):undefined});return {status:response.status,data:await response.json()};};
@@ -42,6 +42,6 @@ test('accounts, authorization, authoritative pricing, persistence and order life
   assert.equal((await request('/auth/logout','POST',{},token)).status,200);
   assert.equal((await request('/auth/profile','GET',null,token)).status,401);
   assert.equal((await request('/not-a-route')).status,404);
- }finally{await new Promise(r=>server.close(r));app.locals.db.close();}
- const reopened=createApp({databasePath});assert.equal(reopened.locals.db.prepare('SELECT COUNT(*) AS count FROM orders').get().count,1);reopened.locals.db.close();fs.rmSync(dir,{recursive:true,force:true});
+ }finally{await new Promise(r=>server.close(r));await app.locals.db.close();}
+ const reopened=await createApp({database});assert.equal(await reopened.locals.db.count('orders'),1);await reopened.locals.db.close();
 });

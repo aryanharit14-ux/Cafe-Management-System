@@ -3,6 +3,8 @@ const assert = require('node:assert/strict');
 const {createHmac} = require('node:crypto');
 const {createApp} = require('../app');
 const {validSignature, createRazorpay} = require('../razorpay');
+const {testDatabase}=require('./database');
+const {importSqlite}=require('../db/import-sqlite');
 const {DatabaseSync} = require('node:sqlite');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -37,9 +39,9 @@ function fakeGateway() {
 }
 async function fixture(t, enabled=true) {
   const gateway=fakeGateway();
-  const app=createApp({databasePath:':memory:',adminEmail:'staff@test.example',adminPassword:'Fixture-staff-password',paymentConfig:enabled?config:{},paymentGateway:gateway});
+  const app=await createApp({database:await testDatabase(),adminEmail:'staff@test.example',adminPassword:'Fixture-staff-password',paymentConfig:enabled?config:{},paymentGateway:gateway});
   const server=app.listen(0,'127.0.0.1');await new Promise(resolve=>server.once('listening',resolve));
-  t.after(async()=>{await new Promise(resolve=>server.close(resolve));app.locals.db.close();});
+  t.after(async()=>{await new Promise(resolve=>server.close(resolve));await app.locals.db.close();});
   const base=`http://127.0.0.1:${server.address().port}/api`;
   const request=async(url,body,token,method=body?'POST':'GET',headers={})=>{
     const response=await fetch(base+url,{method,headers:{'Content-Type':'application/json',...(token?{Authorization:'Bearer '+token}:{}),...headers},body:body?JSON.stringify(body):undefined});
@@ -73,10 +75,10 @@ test('server pricing, concurrent checkout idempotency, signature validation and 
   const payment=gateway.pay(attempt.gatewayOrderId);
   assert.equal((await verify(attempt,payment,{razorpay_signature:'0'.repeat(64)})).status,400);
   assert.equal((await verify(attempt,payment,{razorpay_order_id:'order_wrong'})).status,400);
-  assert.equal(app.locals.db.prepare('SELECT COUNT(*) AS n FROM orders').get().n,0);
+  assert.equal(await app.locals.db.count('orders'),0);
   const result=await verify(attempt,payment);assert.equal(result.status,200);assert.equal(result.data.order.totalAmount,670);assert.equal(result.data.order.paymentStatus,'paid');assert.equal(result.data.order.paymentId,payment.id);
   const repeat=await verify(attempt,payment);assert.equal(repeat.data.order._id,result.data.order._id);
-  assert.equal(app.locals.db.prepare('SELECT COUNT(*) AS n FROM orders').get().n,1);
+  assert.equal(await app.locals.db.count('orders'),1);
   assert.equal((await request('/payments/pending',null,token)).data.length,0);
   assert.equal((await request('/orders/myorders',null,other)).data.length,0);
 });
@@ -92,7 +94,7 @@ test('authorized, failed, mismatched and refunded payments cannot enter the kitc
   payment.currency='USD';assert.equal((await verify(attempt,payment)).status,400);payment.currency='INR';
   payment.order_id='order_different';assert.equal((await verify(attempt,payment)).status,400);payment.order_id=attempt.gatewayOrderId;
   payment.amount_refunded=67000;assert.equal((await verify(attempt,payment)).status,409);
-  assert.equal(app.locals.db.prepare('SELECT COUNT(*) AS n FROM orders').get().n,0);
+  assert.equal(await app.locals.db.count('orders'),0);
 });
 
 test('signed webhooks recover a closed checkout exactly once and refunds stay truthful',async t=>{
@@ -100,9 +102,9 @@ test('signed webhooks recover a closed checkout exactly once and refunds stay tr
   const attempt=await create('webhook-checkout');const payment=gateway.pay(attempt.gatewayOrderId);
   const event={event:'payment.captured',payload:{payment:{entity:payment}}};
   assert.equal((await webhook(event,'0'.repeat(64))).status,400);
-  assert.equal(app.locals.db.prepare('SELECT COUNT(*) AS n FROM orders').get().n,0);
+  assert.equal(await app.locals.db.count('orders'),0);
   const results=await Promise.all([webhook(event),webhook(event),verify(attempt,payment)]);assert.ok(results.every(r=>r.status===200));
-  assert.equal(app.locals.db.prepare('SELECT COUNT(*) AS n FROM orders').get().n,1);
+  assert.equal(await app.locals.db.count('orders'),1);
   const order=(await request('/orders/myorders',null,token)).data[0];
   assert.equal((await request(`/orders/${order._id}/status`,{status:'Cancelled'},staff,'PUT')).data.paymentStatus,'refund_due');
   await webhook(event);assert.equal((await request('/orders/myorders',null,token)).data[0].status,'Cancelled');
@@ -123,7 +125,7 @@ test('payment status checks recover missed callbacks without creating a second g
   const again=await request(`/payments/${attempt.id}/resume`,{},token);assert.equal(again.data.order._id,recovered.data.order._id);assert.equal(gateway.calls,1);
 });
 
-test('catalog migration preserves edited items and old orders, then does not reseed deletions',()=>{
+test('catalog migration preserves edited items and old orders, then does not reseed deletions',async()=>{
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'juniper-migration-'));const file=path.join(dir,'old.sqlite');
   const old=new DatabaseSync(file);
   old.exec(`CREATE TABLE users (id TEXT PRIMARY KEY,name TEXT,email TEXT,password TEXT,role TEXT);
@@ -131,11 +133,15 @@ test('catalog migration preserves edited items and old orders, then does not res
     CREATE TABLE orders (id TEXT PRIMARY KEY,user_id TEXT,items TEXT,total INTEGER,status TEXT,store TEXT,method TEXT,notes TEXT,created_at TEXT,request_key TEXT UNIQUE);
     INSERT INTO menu VALUES ('latte','Staff edited latte','Edited','Hot coffee',999,'/images/latte.jpg','',1);
     INSERT INTO orders VALUES ('legacy','customer','[]',100,'Completed','Central','Takeaway','','2026-01-01','legacy-key');`);old.close();
-  let app=createApp({databasePath:file,paymentConfig:{}});const db=app.locals.db;
-  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM menu').get().n,36);assert.equal(db.prepare("SELECT price FROM menu WHERE id='latte'").get().price,999);
-  assert.equal(db.prepare("SELECT payment_method FROM orders WHERE id='legacy'").get().payment_method,'counter');
-  db.prepare("DELETE FROM menu WHERE id='espresso'").run();db.close();
-  app=createApp({databasePath:file,paymentConfig:{}});assert.equal(app.locals.db.prepare('SELECT COUNT(*) AS n FROM menu').get().n,35);app.locals.db.close();fs.rmSync(dir,{recursive:true,force:true});
+  const database=await testDatabase();
+  await importSqlite(database,file);
+  let app=await createApp({database,paymentConfig:{}});const db=app.locals.db;
+  assert.equal(await db.count('menu'),36);assert.equal((await db.one('menu',{id:'latte'})).price,999);
+  assert.equal((await db.one('orders',{id:'legacy'})).payment_method,'counter');
+  await db.delete('menu',{id:'espresso'});await db.close();
+  app=await createApp({database,paymentConfig:{}});assert.equal(await app.locals.db.count('menu'),35);
+  assert.equal((await importSqlite(database,file)).skipped,true);
+  await app.locals.db.close();fs.rmSync(dir,{recursive:true,force:true});
 });
 
 test('webhook verification uses exact raw bytes and rejects malformed signatures',()=>{

@@ -1,7 +1,7 @@
 const categories = ['Hot coffee', 'Cold coffee', 'Tea & more', 'Refreshers', 'Bakery', 'Kitchen', 'Sandwiches & wraps', 'Desserts'];
 const stores = ['Juniper • Central café', 'Juniper • Riverside café'];
 function checkoutError(message) { return Object.assign(new Error(message), {status:400}); }
-function validateCheckout(db, body = {}) {
+async function validateCheckout(db, body = {}) {
   const {orderItems, store, method, notes = '', requestKey} = body;
   if (!Array.isArray(orderItems) || !orderItems.length || orderItems.length > 50 || !stores.includes(store) || !['Takeaway', 'Dine in'].includes(method) || typeof notes !== 'string' || notes.length > 300 || typeof requestKey !== 'string' || requestKey.length < 8 || requestKey.length > 80) {
     throw checkoutError('Check your basket and pickup details.');
@@ -10,7 +10,7 @@ function validateCheckout(db, body = {}) {
   let total = 0;
   for (const item of orderItems) {
     if (!item || typeof item.menuItem !== 'string' || !Number.isInteger(item.qty) || item.qty < 1 || item.qty > 20) throw checkoutError('Item quantities must be between 1 and 20.');
-    const product = db.prepare('SELECT * FROM menu WHERE id=?').get(item.menuItem);
+    const product = (await db.one('menu',{id:item.menuItem}));
     if (!product || !product.available) throw checkoutError('An item is no longer available. Please update your basket.');
     const drink = ['Hot coffee', 'Cold coffee', 'Tea & more'].includes(product.category);
     const size = drink ? (item.size || 'Regular') : 'Regular';
